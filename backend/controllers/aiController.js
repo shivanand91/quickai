@@ -3,7 +3,9 @@ import { clerkClient } from '@clerk/express';
 import sql from '../configs/db.js'
 import OpenAI from "openai";
 import axios from 'axios';
-import {v2 as cloudinary} from 'cloudinary';
+import { v2 as cloudinary } from 'cloudinary';
+import fs from 'fs';
+import pdf from 'pdf-parse/lib/pdf-parse.js';
 
 const AI = new OpenAI({
     apiKey: process.env.GEMINI_API_KEY,
@@ -124,7 +126,7 @@ export const generateImage = async (req, res) => {
 
     } catch (error) {
         console.log(error.message);
-        res.json({ success: false, message: "Failed to generate article." })
+        res.json({ success: false, message: "Failed to generate image." })
 
     }
 }
@@ -139,25 +141,104 @@ export const removeImageBackground = async (req, res) => {
             return res.json({ success: false, message: 'This feature is only avaliable for premium users.' });
         }
 
-        const form = new FormData()
-        FormData.append('prompt', prompt)
-
-        const { data } = await axios.post("https://clipdrop-api.co/text-to-image/v1", FormData, {
-            headers: { 'x-api-key': process.env.CLIPDROP_API_KEY, },
-            responseType: "arraybuffer"
+        const { secure_url } = await cloudinary.uploader.upload(image.path, {
+            transformation: [
+                {
+                    effect: "background_removal",
+                    background_removal: "remove_the_background"
+                }
+            ]
         })
 
-        const base64Image = `data: image/png;base64,${Buffer.from(data, 'binary').toString('base64')} `
-
-        const { secure_url } = await cloudinary.uploader.upload(base64Image)
-
-        await sql`INSERT INTO creations (user_id, prompt, content, type, publish) VALUES (${userId}, ${prompt}, ${secure_url}, 'image', ${publish ?? false})`;
+        await sql`INSERT INTO creations (user_id, prompt, content, type) VALUES (${userId}, "Remove background from image", ${secure_url}, 'image')`;
 
         res.json({ success: true, secure_url })
 
     } catch (error) {
         console.log(error.message);
-        res.json({ success: false, message: "Failed to generate article." })
+        res.json({ success: false, message: "Failed to remove image background." })
+
+    }
+}
+export const removeImageObject = async (req, res) => {
+    try {
+        const { userId } = req.auth();
+        const { object } = req.body;
+        const { image } = req.file;
+        const plan = req.plan;
+
+        if (plan !== 'premium') {
+            return res.json({ success: false, message: 'This feature is only avaliable for premium users.' });
+        }
+
+        const { public_id } = await cloudinary.uploader.upload(image.path)
+
+        const imageUrl =  cloudinary.url(public_id, {
+            transformation: [
+                {
+                    effect: `gen_romove:${object}`
+                }
+            ],
+            resource_type: 'image'
+        })
+
+        await sql`INSERT INTO creations (user_id, prompt, content, type) VALUES (${userId}, ${`Removed${object} form image`}, ${imageUrl}, 'image')`;
+
+        res.json({ success: true, imageUrl })
+
+    } catch (error) {
+        console.log(error.message);
+        res.json({ success: false, message: "Failed to remove image object." })
+
+    }
+}
+
+export const resumeReview = async (req, res) => {
+    try {
+        const { userId } = req.auth();
+        const  resume  = req.file;
+        const plan = req.plan;
+
+        if (plan !== 'premium') {
+            return res.json({ success: false, message: 'This feature is only avaliable for premium users.' });
+        }
+
+        if (resume.size > 5 * 1024 * 1024) {
+            return res.json({ success: false, message: 'Resume file size exceeds 5MB limit.' });
+        }
+
+        const dataBuffer = fs.readFileSync(resume.path);
+        const pdfData = await pdf(dataBuffer);
+
+        const prompt = `Review this resume and provide feedback on the following aspects:
+        1. Overall structure and formatting
+        2. Clarity and conciseness of the content
+        3. Relevance of the information provided
+        4. Suggestions for improvement
+        Resume Content: ${pdfData.text}`;
+
+        const response = await AI.chat.completions.create({
+            model: "gemini-2.0-flash",
+            messages: [
+                {
+                    role: "user",
+                    content: prompt,
+                },
+            ],
+            temperature: 0.7,
+            max_tokens: 1000,
+        });
+
+        const content = response.choices[0].message.content;
+
+
+        await sql`INSERT INTO creations (user_id, prompt, content, type) VALUES (${userId}, 'Review the uploaded image', ${content}, 'review-resume')`;
+
+        res.json({ success: true, content })
+
+    } catch (error) {
+        console.log(error.message);
+        res.json({ success: false, message: "Failed to review resume." })
 
     }
 }
